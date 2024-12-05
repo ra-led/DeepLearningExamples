@@ -38,7 +38,6 @@ class ResNet(nn.Module):
         if backbone_path:
             backbone.load_state_dict(torch.load(backbone_path))
 
-
         self.feature_extractor = nn.Sequential(*list(backbone.children())[:7])
 
         conv4_block1 = self.feature_extractor[-1][0]
@@ -48,8 +47,16 @@ class ResNet(nn.Module):
         conv4_block1.downsample[0].stride = (1, 1)
 
     def forward(self, x):
-        x = self.feature_extractor(x)
-        return x
+        features = []
+        for layer in self.feature_extractor:
+            x = layer(x)
+            if isinstance(layer, nn.Sequential):
+                for sub_layer in layer:
+                    if isinstance(sub_layer, nn.Conv2d):
+                        features.append(x)
+            else:
+                features.append(x)
+        return features
 
 
 class SSD300(nn.Module):
@@ -228,22 +235,22 @@ class FeatureFusionSSD300(SSD300):
             ))
 
     def forward(self, x):
-        x = self.feature_extractor(x)
-        # Assume x is a list of feature maps from the backbone
-        # x[2] is conv4_3 equivalent, x[3] is conv5_3 equivalent
+        features = self.feature_extractor(x)
+        # Assume features is a list of feature maps from the backbone
+        # features[2] is conv4_3 equivalent, features[3] is conv5_3 equivalent
         if self.fusion_type == 'concat':
             # Fuse layer2 and layer3
-            fused = self.fusion_layers[0](x[3])
-            fused = torch.cat((x[2], fused), dim=1)
+            fused = self.fusion_layers[0](features[3])
+            fused = torch.cat((features[2], fused), dim=1)
             fused = self.fusion_layers[1](fused)
-            x[2] = fused
+            features[2] = fused
         elif self.fusion_type == 'element-sum':
             # Fuse layer2 and layer3
-            fused = self.fusion_layers[0](x[3])
-            fused = x[2] + fused
-            x[2] = fused
+            fused = self.fusion_layers[0](features[3])
+            fused = features[2] + fused
+            features[2] = fused
 
-        detection_feed = [x[2]]  # Start from the fused layer
+        detection_feed = [features[2]]  # Start from the fused layer
         for l in self.additional_blocks:
             x = l(x[-1])
             detection_feed.append(x)
