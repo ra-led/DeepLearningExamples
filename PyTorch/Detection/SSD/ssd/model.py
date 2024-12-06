@@ -38,6 +38,7 @@ class ResNet(nn.Module):
         if backbone_path:
             backbone.load_state_dict(torch.load(backbone_path))
 
+
         self.feature_extractor = nn.Sequential(*list(backbone.children())[:7])
 
         conv4_block1 = self.feature_extractor[-1][0]
@@ -47,15 +48,12 @@ class ResNet(nn.Module):
         conv4_block1.downsample[0].stride = (1, 1)
 
     def forward(self, x):
+        # x = self.feature_extractor(x)
+        # return x
         features = []
-        for layer in self.feature_extractor:
+        for i, layer in enumerate(self.feature_extractor):
             x = layer(x)
-            if isinstance(layer, nn.Sequential):
-                for sub_layer in layer:
-                    if isinstance(sub_layer, nn.Conv2d):
-                        features.append(x)
-            else:
-                features.append(x)
+            features.append(x)
         return features
 
 
@@ -211,28 +209,38 @@ class FeatureFusionSSD300(SSD300):
         self.out_channels = backbone.out_channels
         self.fusion_layers = nn.ModuleList()
 
-        # Assuming fusion between layer 2 (conv4_3 equivalent) and layer 3 (conv5_3 equivalent)
-        layer2_channels = self.out_channels[2]
-        layer3_channels = self.out_channels[3]
+        conv4_3_channels = 256
+        conv5_3_channels = 512
 
         if fusion_type == 'concat':
-            # Upsample layer3 to match layer2's size
-            self.fusion_layers.append(nn.Sequential(
-                nn.ConvTranspose2d(layer3_channels, layer3_channels, kernel_size=2, stride=2),
-                nn.Conv2d(layer3_channels, layer2_channels, kernel_size=3, padding=1),
-                nn.BatchNorm2d(layer2_channels),
+            # Upsample conv5_3 to match conv4_3 size
+            self.fusion_layers_5_3 = nn.Sequential(
+                nn.ConvTranspose2d(conv5_3_channels, conv4_3_channels, kernel_size=2, stride=2),
+                nn.Conv2d(conv4_3_channels, conv4_3_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(conv4_3_channels),
                 nn.ReLU(inplace=True)
-            ))
+            )
+            # conv4_3 learning the better features to fuse
+            self.fusion_layers_4_3 = nn.Sequential(
+                nn.Conv2d(conv4_3_channels, conv4_3_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(conv4_3_channels),
+                nn.ReLU(inplace=True)
+            )
             # Concatenate and reduce channels
-            self.fusion_layers.append(nn.Conv2d(layer2_channels*2, layer2_channels, kernel_size=1))
+            self.fusion_layers_con = nn.Conv2d(conv4_3_channels*2, conv4_3_channels, kernel_size=1)
         elif fusion_type == 'element-sum':
-            # Upsample layer3 to match layer2's size
-            self.fusion_layers.append(nn.Sequential(
-                nn.ConvTranspose2d(layer3_channels, layer2_channels, kernel_size=2, stride=2),
-                nn.Conv2d(layer2_channels, layer2_channels, kernel_size=3, padding=1),
-                nn.BatchNorm2d(layer2_channels),
-                nn.ReLU(inplace=True)
-            ))
+            # Upsample conv5_3 to match conv4_3 size
+            self.fusion_layers_5_3 = nn.Sequential(
+                nn.ConvTranspose2d(conv5_3_channels, conv4_3_channels, kernel_size=2, stride=2),
+                nn.Conv2d(conv4_3_channels, conv4_3_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(conv4_3_channels),
+            )
+            # conv4_3 learning the better features to fuse
+            self.fusion_layers_4_3 = nn.Sequential(
+                nn.Conv2d(conv4_3_channels, conv4_3_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(conv4_3_channels),
+            )
+            self.fusion_activation = nn.ReLU(inplace=True)
 
     def forward(self, x):
         features = self.feature_extractor(x)
@@ -240,20 +248,24 @@ class FeatureFusionSSD300(SSD300):
         # features[2] is conv4_3 equivalent, features[3] is conv5_3 equivalent
         if self.fusion_type == 'concat':
             # Fuse layer2 and layer3
-            fused = self.fusion_layers[0](features[3])
-            fused = torch.cat((features[2], fused), dim=1)
-            fused = self.fusion_layers[1](fused)
-            features[2] = fused
+            fused = torch.cat(
+                (
+                    self.fusion_layers_4_3(features[-3]),
+                    self.fusion_layers_5_3(features[-2])
+                ),
+                dim=1
+            )
+            fused = self.fusion_layers_con(fused)
         elif self.fusion_type == 'element-sum':
             # Fuse layer2 and layer3
-            fused = self.fusion_layers[0](features[3])
-            fused = features[2] + fused
-            features[2] = fused
+            fused = self.fusion_layers_4_3(features[-2]) + self.fusion_layers_5_3(features[-1])
+            fused = self.fusion_activation(fused)
 
-        detection_feed = [features[2]]  # Start from the fused layer
+        additional_x = features[-1]    
+        detection_feed = [fused, additional_x]  # Start from the fused layer
         for l in self.additional_blocks:
-            x = l(x[-1])
-            detection_feed.append(x)
+            additional_x = l(additional_x)
+            detection_feed.append(additional_x)
 
         locs, confs = self.bbox_view(detection_feed, self.loc, self.conf)
         return locs, confs
